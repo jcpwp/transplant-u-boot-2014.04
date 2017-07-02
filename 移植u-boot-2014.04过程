@@ -1,0 +1,269 @@
+移植U-BOOT-2014.04
+一.准备工作
+1.从官网上下载新版本的U-BOOT 网址：http://www.denx.de/wiki/U-Boot/SourceCode然后下载完成后利用FTP工具从本地上传到服务器上
+2.解压文件：tar xjf u-boot-2014.04.tar.bz2
+3.在本地新建source insight工程，方便查看U-BOOT源码
+3.我使用的是4.3.2的工具链
+二。
+1.在服务器上将u-boot解压完成后，进入u-boot中
+cd u-boot-2014.04
+
+2.u-boot不像内核一样有一个配置界面，所以我们需要手动配置修改代码。
+因为我使用的是JZ2440开发板，但U-BOOT-2014.04不支持2440。
+不过支持smdk2410，所以可以根据2410进行修改
+
+3.尝试配置编译
+make smdk2410_config
+make 
+编译出现错误：lib/asm-offsets.c:1:0: error: bad value (armv4) for
+网上查阅资料是没有设置交叉编译工具链。也就是没有指定交叉编译工具
+解决放法：
+①.配置环境变量，将交叉编译工具链添加在环境变量中或者在编译时带上参数，
+例如如make CROSS_COMPILE=arm-none-linux-gnueabi-
+②.在U-boot顶层的Makefile中添加交叉编译选项
+因为我的环境变量是设置好的，所以我选择第二种方法
+# set default to nothing for native builds
+ifeq ($(HOSTARCH),$(ARCH))
+CROSS_COMPILE ?=
+endif
+CROSS_COMPILE =arm-linux-  在这里指定交叉编译为arm-linux-
+修改后重新编译，编译成功。
+
+4.将生成的u-boot.bin下载到单板中，重新启动没有任何反应。
+
+5.分析u-boot.lds链接文件
+u-boot.lds文件中分为代码段、只读数据段、数据段、u_boot_list、rel_dyn、bss段
+发现代码段的开始是从arch/arm/cpu/arm920t/start.S这个文件开始的。
+并且从链接脚本中可以知道.bin文件不包括bss段。
+
+6.分析arch/arm/cpu/arm920t/start.S
+start.S是启动文件。
+①设置CPU模式为SVC32模式
+②关看门狗
+③时钟分频
+这里时钟设置应该为FCLK:HCLK:PCLK=1：2：4 对于JZ2440HCLK推荐使用100MHZ
+FCLK用于cpu核，根据CPU不同的工作电压有不同的工作频率，200Mhz<=FCLK<=600Mhz
+HCLK用于AHB总线上的设备，例如用于cpu核、存储控制器、中断控制器、LCD控制器，频率就可能和实际用到的SDRAM或者LCD有关
+PCLK用于APB总线上的设备，例如WATCHDOG、IIS、I2C等
+在这里HCLK应该设置为100MHz，通过时钟分频寄存器进行设置CLKDIVN，设置为5
+设置后的结果是：FCLK=400 HCLK=100 PCLK=50
+
+④如果HDIVN不是0，因为我们上面设置的寄存器数为5，所以HDIVN不是0.
+要进行CPU总线模式设置将“fast bus mode”变为“asynchronous bus mode”
+设置代码：
+	mrc    p15, 0, r1, c1, c0, 0         /* 读出控制寄存器 */ 
+	orr     r1, r1, #0xc0000000          /* 设置为“asynchronous bus mode” */
+	mcr    p15, 0, r1, c1, c0, 0        /* 写入控制寄存器 */
+
+⑤初始化时钟频率
+	ldr r0 , =0x4c000004
+	ldr r1 , =S3C2440_MPLL_400MHZ
+	str r1 , [r0]
+	
+⑥启动ICACHE
+	mrc p15, 0 ,r0 ,c1 ,c0,0 /*协处理器到ARM寄存器，相当于从协处理器读数据到ARM*/
+	orr  r0   , r0, #(1<<12)
+	mcr p15, 0 ,r0 ,c1, c0,0/*写入控制寄存器*/
+	启动ICACHE的好处是可以快速启动
+
+⑦跳转到cpu_init_crit
+从名字可以看出这个是对CPU初始化，
+修改屏蔽掉flush v4 I/D caches，在前面已经对ICACHE已经设置
+跳转到  lowlevel_init  这个函数是更底层的初始化
+对memory control configuration内存控制器进行初始化，初始化SDRAM，设置时序
+
+⑧CPU初始化完成后，直接跳到_main
+跳到arch/arm/lib/crt0.S中
+
+⑨设置栈，在内存分配一个gd_t结构体，跳转到board_init_f
+board_init_f中对底层的一些初始化，还有内存分布的情况
+初始化函数的队列
+init_fnc_t *init_sequence[] = {
+	arch_cpu_init,		/* basic arch cpu dependent setup */
+	mark_bootstage,
+#ifdef CONFIG_OF_CONTROL
+	fdtdec_check_fdt,
+#endif
+#if defined(CONFIG_BOARD_EARLY_INIT_F)
+	board_early_init_f,
+#endif
+	timer_init,		/* initialize timer */
+#ifdef CONFIG_BOARD_POSTCLK_INIT
+	board_postclk_init,
+#endif
+#ifdef CONFIG_FSL_ESDHC
+	get_clocks,
+#endif
+	env_init,		/* initialize environment */
+	init_baudrate,		/* initialze baudrate settings */
+	serial_init,		/* serial communications setup */
+	console_init_f,		/* stage 1 init of console */
+	display_banner,		/* say that we are here */
+	print_cpuinfo,		/* display cpu info (and speed) */
+#if defined(CONFIG_DISPLAY_BOARDINFO)
+	checkboard,		/* display board info */
+#endif
+#if defined(CONFIG_HARD_I2C) || defined(CONFIG_SYS_I2C)
+	init_func_i2c,
+#endif
+	dram_init,		/* configure available RAM banks */
+	NULL,
+};
+内存分布：
+
+最后得到三个地址：addr(u-boot的链接地址也就是重定位后的开始地址)、addr_sp（重新设置的栈地址）、reloc_off（链接地址的偏移地址）
+
+⑩
+在crt0.S中将得到的栈地址重新设置，开始代码重定位，需要将代码拷到SDRAM上
+先设置返回值：
+  adr	lr, here
+	ldr	r0, [r9, #GD_RELOC_OFF]		/* r0 = gd->reloc_off *//*偏移地址大小为33F2E000*/
+	add	lr, lr, r0 //这个lr表示的就是代码重定位后的地址值。
+再设置链接地址：
+	ldr	r0, [r9, #GD_RELOCADDR]		/* r0 = gd->relocaddr */
+跳转到 relocate_code 开始代码重定位
+
+11：
+跳转到arch/arm/lib/relocate.S继续执行
+先确定要重定位代码的大小，也就是二进制文件的大小，不包括BSS段
+	ldr	r1, =__image_copy_start	/* r1 <- SRC &__image_copy_start */
+	subs	r4, r0, r1		/* r4 <- relocation offset */
+	beq	relocate_done		/* skip relocation */
+	ldr	r2, =__image_copy_end	/* r2 <- SRC &__image_copy_end */
+
+这段代码的作用：r1为二进制文件的开始地址，第二行是判断链接地址是否和二进制文件的开始地址相同，
+如果相同，通过第三行跳转到relocate_done（这里是重定位完成，给PC赋返回值），如果不相等，r2为
+二进制文件的结束地址。
+
+开始重定位：
+copy_loop:
+	ldmia	r1!, {r10-r11}		/* copy from source address [r1]    */
+	stmia	r0!, {r10-r11}		/* copy to   target address [r0]    */
+	cmp	r1, r2			/* until source end address [r2]    */
+	blo	copy_loop
+
+如何生成反汇编文件：arm-linux-objdump -D u-boot > u-boot.dis
+
+.rel.dyn的重定位，这段可以根据反汇编文件来理解这段的意思：
+	/*
+	 * fix .rel.dyn relocations
+	 */
+	ldr	r2, =__rel_dyn_start	/* r2 <- SRC &__rel_dyn_start */
+	ldr	r3, =__rel_dyn_end	/* r3 <- SRC &__rel_dyn_end */
+fixloop:
+	ldmia	r2!, {r0-r1}		/* (r0,r1) <- (SRC location,fixup) */
+	and	r1, r1, #0xff
+	cmp	r1, #23			/* relative fixup? */
+	bne	fixnext
+
+	/* relative fix: increase location by offset */
+	add	r0, r0, r4
+	ldr	r1, [r0]
+	add	r1, r1, r4
+	str	r1, [r0]
+fixnext:
+	cmp	r2, r3
+	blo	fixloop
+
+然后重定位完成，返回lr是通过BX lr只是跳转
+
+12:
+从here:继续执行
+bl	c_runtime_cpu_setup  跳转后执行的是mov pc ,lr
+接着是清除栈，用汇编完成，
+	ldr	r0, =__bss_start	/* this is auto-relocated! */
+	ldr	r1, =__bss_end		/* this is auto-relocated! */
+
+	mov	r2, #0x00000000		/* prepare zero to clear BSS */
+
+clbss_l:cmp	r0, r1			/* while not at end of BSS */
+	strlo	r2, [r0]		/* clear 32-bit BSS word */
+	addlo	r0, r0, #4		/* move to next */
+	blo	clbss_l
+
+以上称作为U-BOOT启动的第一阶段
+这里已经将第一阶段所做的事情分析的很清楚，发现这个代码是支持NOR FLASH启动的
+我们可以将代码编译然后下载到单板观察是够能正常启动
+
+第一步：创建自己的单板，因为我是用的JZ2440
+在board/samsung下只有smdk2410,所以要创建smdk2440文件夹
+在服务器上可以用如下命令  
+cp smdk2410 smdk2440 -rf
+cd ../../include/configs/
+cp smdk2410.h smdk2440.h
+
+修改boards.cfg:
+仿照
+smdk2410                     arm         arm920t     -                   samsung        s3c24x0
+添加：
+smdk2440                     arm         arm920t     -                   samsung        s3c24x0
+
+编译步骤：
+make smdk2440_config
+make
+
+将生成的u-boot.bin下载到单板中，启动发现有现象但是输出乱码，就要找乱码的原因
+原因：
+1.在board_init_f中的初始化函数队列中board_early_init_f对MPLL又进行了设置
+因为我们在前面已经对MPLL进行了设置，所以这里不需要再进行设置
+2.在初始化函数队列中有timer_init，在timer_init中有get_HCLK（）它有个2440的宏没有定义，我们可以
+在include/configs中屏蔽掉#define config_s3c2410定义#define config_s3c2440
+将修改的代码重新上传到服务器，编译可能会出错，就把错误解决掉，应该是屏蔽掉一些宏
+	
+	修改的地方：smdk2440.h
+	去掉//#define CONFIG_S3C2410
+	添加	#define CONFIG_S3C2440 这里是因为在timer_init中对PCLK进行了设置，缺少2440的宏
+	
+	修改后编译，出错  在smdk2440.h中修改为 //#define CONFIG_CMD_NAND
+	编译再次出错在config_cmd_all.h中再修改为//#define CONFIG_CMD_NAND		/* NAND support	
+	再出错include/configs/smdk2440.h:227://#define CONFIG_YAFFS2 
+
+最后将编译成功的U-BOOT.BIN下载到单板中，没有乱码出现，但是没能正常启动，有错误信息出现，将错误信息
+在代码中查找
+启动卡在了这个地方		puts(failed);
+											hang();
+将这两句话屏蔽掉，原因是这里还不支持相应的Flash，重新编译，启动成功
+
+从这里U-BOOT已经从NOR FLASH启动成功，接下来就要从NAND FLASH启动
+
+接下来要修改U-BOOT从NAND FLASH启动
+主要对crt0.S中代码进行修改
+从NAND启动的条件要使重定位之前的代码小于4K，因为原代码中有-pie的选项，使得代码非常大，所以先要去掉
+-pie 在arch/arm/config.mk中
+
+参考"毕业班第1课"的start.S, init.c来修改代码
+      把init.c放入board/samsung/smdk2440目录, 修改Makefile
+      修改CONFIG_SYS_TEXT_BASE为0x33f80000
+      修改start.S
+修改board_init_f, 把relocate_code去掉
+修改链接脚本: 把start.S, init.c, lowlevel.S等文件放在最前面
+      ./arch/arm/cpu/u-boot.lds：  
+      board/samsung/smdk2440/built_in.o
+编译过程中可能会遇到一些问题，可以百度解决，主要是能读懂u-boot得源码再进行修改
+
+
+
+下面是U-BOOT的第二阶段
+13：
+设置参数一个是gd_t*id  一个是目的地址
+设置栈 mov  r0, r9                  /* gd_t */ /*这里也就是新栈的地址*/
+设置链接地址 ldr	r1, [r9, #GD_RELOCADDR]	/* dest_addr *//*程序的链接地址,也就是，目的地址*/
+然后跳转到board_init_r
+
+
+
+
+
+在第一阶段遇到的问题：
+移植u-boot-2014.04,在分析内存分布时有一点不是很清楚，在crt0.S中有如下代码：
+	ldr	sp, [r9, #GD_START_ADDR_SP]	/* sp = gd->start_addr_sp */
+	bic	sp, sp, #7	/* 8-byte alignment for ABI compliance */
+	ldr	r9, [r9, #GD_BD]		/* r9 = gd->bd */
+	sub	r9, r9, #GD_SIZE		/* new GD is below bd */
+意思是设置栈:通过链接脚本得出sp=0x30000f60这就是先设置的栈地址
+然后在划出160字节的gd_t存放u-boot的一些信息，这个GD_SIZE就是gd_t结构体的大小
+ 
+
+
+
+
