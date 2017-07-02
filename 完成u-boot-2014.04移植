@@ -1,0 +1,635 @@
+移植U-BOOT-2014.04
+一.准备工作
+1.从官网上下载新版本的U-BOOT 网址：http://www.denx.de/wiki/U-Boot/SourceCode然后下载完成后利用FTP工具从本地上传到服务器上
+2.解压文件：tar xjf u-boot-2014.04.tar.bz2
+3.在本地新建source insight工程，方便查看U-BOOT源码
+3.我使用的是4.3.2的工具链
+二。
+1.在服务器上将u-boot解压完成后，进入u-boot中
+cd u-boot-2014.04
+
+2.u-boot不像内核一样有一个配置界面，所以我们需要手动配置修改代码。
+因为我使用的是JZ2440开发板，但U-BOOT-2014.04不支持2440。
+不过支持smdk2410，所以可以根据2410进行修改
+
+3.尝试配置编译
+make smdk2410_config
+make 
+编译出现错误：lib/asm-offsets.c:1:0: error: bad value (armv4) for
+网上查阅资料是没有设置交叉编译工具链。也就是没有指定交叉编译工具
+解决放法：
+①.配置环境变量，将交叉编译工具链添加在环境变量中或者在编译时带上参数，
+例如如make CROSS_COMPILE=arm-none-linux-gnueabi-
+②.在U-boot顶层的Makefile中添加交叉编译选项
+因为我的环境变量是设置好的，所以我选择第二种方法
+# set default to nothing for native builds
+ifeq ($(HOSTARCH),$(ARCH))
+CROSS_COMPILE ?=
+endif
+CROSS_COMPILE =arm-linux-  在这里指定交叉编译为arm-linux-
+修改后重新编译，编译成功。
+
+4.将生成的u-boot.bin下载到单板中，重新启动没有任何反应。
+
+5.分析u-boot.lds链接文件
+u-boot.lds文件中分为代码段、只读数据段、数据段、u_boot_list、rel_dyn、bss段
+发现代码段的开始是从arch/arm/cpu/arm920t/start.S这个文件开始的。
+并且从链接脚本中可以知道.bin文件不包括bss段。
+
+6.分析arch/arm/cpu/arm920t/start.S
+start.S是启动文件。
+①设置CPU模式为SVC32模式
+②关看门狗
+③时钟分频
+这里时钟设置应该为FCLK:HCLK:PCLK=1：2：4 对于JZ2440HCLK推荐使用100MHZ
+FCLK用于cpu核，根据CPU不同的工作电压有不同的工作频率，200Mhz<=FCLK<=600Mhz
+HCLK用于AHB总线上的设备，例如用于cpu核、存储控制器、中断控制器、LCD控制器，频率就可能和实际用到的SDRAM或者LCD有关
+PCLK用于APB总线上的设备，例如WATCHDOG、IIS、I2C等
+在这里HCLK应该设置为100MHz，通过时钟分频寄存器进行设置CLKDIVN，设置为5
+设置后的结果是：FCLK=400 HCLK=100 PCLK=50
+
+④如果HDIVN不是0，因为我们上面设置的寄存器数为5，所以HDIVN不是0.
+要进行CPU总线模式设置将“fast bus mode”变为“asynchronous bus mode”
+设置代码：
+	mrc    p15, 0, r1, c1, c0, 0         /* 读出控制寄存器 */ 
+	orr     r1, r1, #0xc0000000          /* 设置为“asynchronous bus mode” */
+	mcr    p15, 0, r1, c1, c0, 0        /* 写入控制寄存器 */
+
+⑤初始化时钟频率
+	ldr r0 , =0x4c000004
+	ldr r1 , =S3C2440_MPLL_400MHZ
+	str r1 , [r0]
+	
+⑥启动ICACHE
+	mrc p15, 0 ,r0 ,c1 ,c0,0 /*协处理器到ARM寄存器，相当于从协处理器读数据到ARM*/
+	orr  r0   , r0, #(1<<12)
+	mcr p15, 0 ,r0 ,c1, c0,0/*写入控制寄存器*/
+	启动ICACHE的好处是可以快速启动
+
+⑦跳转到cpu_init_crit
+从名字可以看出这个是对CPU初始化，
+修改屏蔽掉flush v4 I/D caches，在前面已经对ICACHE已经设置
+跳转到  lowlevel_init  这个函数是更底层的初始化
+对memory control configuration内存控制器进行初始化，初始化SDRAM，设置时序
+
+⑧CPU初始化完成后，直接跳到_main
+跳到arch/arm/lib/crt0.S中
+
+⑨设置栈，在内存分配一个gd_t结构体，跳转到board_init_f
+board_init_f中对底层的一些初始化，还有内存分布的情况
+初始化函数的队列
+init_fnc_t *init_sequence[] = {
+	arch_cpu_init,		/* basic arch cpu dependent setup */
+	mark_bootstage,
+#ifdef CONFIG_OF_CONTROL
+	fdtdec_check_fdt,
+#endif
+#if defined(CONFIG_BOARD_EARLY_INIT_F)
+	board_early_init_f,
+#endif
+	timer_init,		/* initialize timer */
+#ifdef CONFIG_BOARD_POSTCLK_INIT
+	board_postclk_init,
+#endif
+#ifdef CONFIG_FSL_ESDHC
+	get_clocks,
+#endif
+	env_init,		/* initialize environment */
+	init_baudrate,		/* initialze baudrate settings */
+	serial_init,		/* serial communications setup */
+	console_init_f,		/* stage 1 init of console */
+	display_banner,		/* say that we are here */
+	print_cpuinfo,		/* display cpu info (and speed) */
+#if defined(CONFIG_DISPLAY_BOARDINFO)
+	checkboard,		/* display board info */
+#endif
+#if defined(CONFIG_HARD_I2C) || defined(CONFIG_SYS_I2C)
+	init_func_i2c,
+#endif
+	dram_init,		/* configure available RAM banks */
+	NULL,
+};
+内存分布：
+
+最后得到三个地址：addr(u-boot的链接地址也就是重定位后的开始地址)、addr_sp（重新设置的栈地址）、reloc_off（链接地址的偏移地址）
+
+⑩
+在crt0.S中将得到的栈地址重新设置，开始代码重定位，需要将代码拷到SDRAM上
+先设置返回值：
+  adr	lr, here
+	ldr	r0, [r9, #GD_RELOC_OFF]		/* r0 = gd->reloc_off *//*偏移地址大小为33F2E000*/
+	add	lr, lr, r0 //这个lr表示的就是代码重定位后的地址值。
+再设置链接地址：
+	ldr	r0, [r9, #GD_RELOCADDR]		/* r0 = gd->relocaddr */
+跳转到 relocate_code 开始代码重定位
+
+11：
+跳转到arch/arm/lib/relocate.S继续执行
+先确定要重定位代码的大小，也就是二进制文件的大小，不包括BSS段
+	ldr	r1, =__image_copy_start	/* r1 <- SRC &__image_copy_start */
+	subs	r4, r0, r1		/* r4 <- relocation offset */
+	beq	relocate_done		/* skip relocation */
+	ldr	r2, =__image_copy_end	/* r2 <- SRC &__image_copy_end */
+
+这段代码的作用：r1为二进制文件的开始地址，第二行是判断链接地址是否和二进制文件的开始地址相同，
+如果相同，通过第三行跳转到relocate_done（这里是重定位完成，给PC赋返回值），如果不相等，r2为
+二进制文件的结束地址。
+
+开始重定位：
+copy_loop:
+	ldmia	r1!, {r10-r11}		/* copy from source address [r1]    */
+	stmia	r0!, {r10-r11}		/* copy to   target address [r0]    */
+	cmp	r1, r2			/* until source end address [r2]    */
+	blo	copy_loop
+
+如何生成反汇编文件：arm-linux-objdump -D u-boot > u-boot.dis
+
+.rel.dyn的重定位，这段可以根据反汇编文件来理解这段的意思：
+	/*
+	 * fix .rel.dyn relocations
+	 */
+	ldr	r2, =__rel_dyn_start	/* r2 <- SRC &__rel_dyn_start */
+	ldr	r3, =__rel_dyn_end	/* r3 <- SRC &__rel_dyn_end */
+fixloop:
+	ldmia	r2!, {r0-r1}		/* (r0,r1) <- (SRC location,fixup) */
+	and	r1, r1, #0xff
+	cmp	r1, #23			/* relative fixup? */
+	bne	fixnext
+
+	/* relative fix: increase location by offset */
+	add	r0, r0, r4
+	ldr	r1, [r0]
+	add	r1, r1, r4
+	str	r1, [r0]
+fixnext:
+	cmp	r2, r3
+	blo	fixloop
+
+然后重定位完成，返回lr是通过BX lr只是跳转
+
+12:
+从here:继续执行
+bl	c_runtime_cpu_setup  跳转后执行的是mov pc ,lr
+接着是清除栈，用汇编完成，
+	ldr	r0, =__bss_start	/* this is auto-relocated! */
+	ldr	r1, =__bss_end		/* this is auto-relocated! */
+
+	mov	r2, #0x00000000		/* prepare zero to clear BSS */
+
+clbss_l:cmp	r0, r1			/* while not at end of BSS */
+	strlo	r2, [r0]		/* clear 32-bit BSS word */
+	addlo	r0, r0, #4		/* move to next */
+	blo	clbss_l
+
+以上称作为U-BOOT启动的第一阶段
+这里已经将第一阶段所做的事情分析的很清楚，发现这个代码是支持NOR FLASH启动的
+我们可以将代码编译然后下载到单板观察是够能正常启动
+
+第一步：创建自己的单板，因为我是用的JZ2440
+在board/samsung下只有smdk2410,所以要创建smdk2440文件夹
+在服务器上可以用如下命令  
+cp smdk2410 smdk2440 -rf
+cd ../../include/configs/
+cp smdk2410.h smdk2440.h
+
+修改boards.cfg:
+仿照
+smdk2410                     arm         arm920t     -                   samsung        s3c24x0
+添加：
+smdk2440                     arm         arm920t     -                   samsung        s3c24x0
+
+编译步骤：
+make smdk2440_config
+make
+
+将生成的u-boot.bin下载到单板中，启动发现有现象但是输出乱码，就要找乱码的原因
+原因：
+1.在board_init_f中的初始化函数队列中board_early_init_f对MPLL又进行了设置
+因为我们在前面已经对MPLL进行了设置，所以这里不需要再进行设置
+2.在初始化函数队列中有timer_init，在timer_init中有get_HCLK（）它有个2440的宏没有定义，我们可以
+在include/configs中屏蔽掉#define config_s3c2410定义#define config_s3c2440
+将修改的代码重新上传到服务器，编译可能会出错，就把错误解决掉，应该是屏蔽掉一些宏
+	
+	修改的地方：smdk2440.h
+	去掉//#define CONFIG_S3C2410
+	添加	#define CONFIG_S3C2440 这里是因为在timer_init中对PCLK进行了设置，缺少2440的宏
+	
+	修改后编译，出错  在smdk2440.h中修改为 //#define CONFIG_CMD_NAND
+	编译再次出错在config_cmd_all.h中再修改为//#define CONFIG_CMD_NAND		/* NAND support	
+	再出错include/configs/smdk2440.h:227://#define CONFIG_YAFFS2 
+
+最后将编译成功的U-BOOT.BIN下载到单板中，没有乱码出现，但是没能正常启动，有错误信息出现，将错误信息
+在代码中查找
+启动卡在了这个地方		puts(failed);
+											hang();
+将这两句话屏蔽掉，原因是这里还不支持相应的Flash，重新编译，启动成功
+
+从这里U-BOOT已经从NOR FLASH启动成功，接下来就要从NAND FLASH启动
+
+接下来要修改U-BOOT从NAND FLASH启动
+主要对crt0.S中代码进行修改
+从NAND启动的条件要使重定位之前的代码小于4K，因为原代码中有-pie的选项，使得代码非常大，所以先要去掉
+-pie 在arch/arm/config.mk中
+
+参考"毕业班第1课"的start.S, init.c来修改代码
+      把init.c放入board/samsung/smdk2440目录, 修改Makefile
+      修改CONFIG_SYS_TEXT_BASE为0x33f80000
+      修改start.S
+修改board_init_f, 把relocate_code去掉
+修改链接脚本: 把start.S, init.c, lowlevel.S等文件放在最前面
+      ./arch/arm/cpu/u-boot.lds：  
+      board/samsung/smdk2440/built_in.o
+编译过程中可能会遇到一些问题，可以百度解决，主要是能读懂u-boot得源码再进行修改
+
+
+
+下面是U-BOOT的第二阶段
+13：
+设置参数一个是gd_t*id  一个是目的地址
+设置栈 mov  r0, r9                  /* gd_t */ /*这里也就是新栈的地址*/
+设置链接地址 ldr	r1, [r9, #GD_RELOCADDR]	/* dest_addr *//*程序的链接地址,也就是，目的地址*/
+然后跳转到board_init_r
+
+
+虽然可以从NOR和NAND启动成功，但还是不能支持NOR和NAND，所以下一步要使u-boot支持Nor
+在arch/arm/lib/board.c中，有第二阶段的入口board_init_r
+在上面我们知道当我们从Nor Flash 启动的时候，不能成功启动因为卡在了如下代码处：
+	puts(failed);
+	hang();
+我们修改为如下：
+	puts("0 kb\n\r");
+		//puts(failed);
+		//hang();
+成功启动，原因是什么？可以分析一下代码
+
+#if !defined(CONFIG_SYS_NO_FLASH) 这里的这个宏在源码中是没有定义的
+	puts("Flash: ");
+	flash_size = flash_init(); 
+	if (flash_size > 0) {  //这里是对flash大小的判断，如果大于0执行下面的
+# ifdef CONFIG_SYS_FLASH_CHECKSUM
+		print_size(flash_size, "");
+		/*
+		 * Compute and print flash CRC if flashchecksum is set to 'y'
+		 *
+		 * NOTE: Maybe we should add some WATCHDOG_RESET()? XXX
+		 */
+		if (getenv_yesno("flashchecksum") == 1) {
+			printf("  CRC: %08X", crc32(0,
+				(const unsigned char *) CONFIG_SYS_FLASH_BASE,
+				flash_size));
+		}
+		putc('\n');   
+# endif /* CONFIG_SYS_FLASH_CHECKSUM */
+	}
+	 else { //否则就来执行这里，所以程序会卡死在这里
+	
+	puts("0 kb\n\r");
+		//puts(failed);
+		//hang();
+	}
+#endif
+
+分析代码后应该很清楚问题出在哪里了，flash_size = flash_init(); 这个函数的问题，没有读出flash大小
+分析flash_init() 位置在drivers/mtd/cfi_flash.c
+在这个函数中可以看到：
+if (!flash_detect_legacy(cfi_flash_bank_addr(i), i))
+			flash_get_size(cfi_flash_bank_addr(i), i);
+
+这两条语句，就是两种得到flash的大小方法
+进入flash_detect_legacy和flash_get_size查看也不确定使用的是哪个函数，但里面有很多DEBUG信息，
+我们可以利用打印信息来判断使用的是哪个检测函数。
+添加DEBUG方法：
+#define _DEBUG  1
+#define   DEBUG  1
+修改代码，重新编译，下载，观察u-boot打印的信息如下：
+Flash: fwc addr 00000000 cmd f0 00f0 16bit x 16 bit
+fwc addr 0000aaaa cmd aa 00aa 16bit x 16 bit
+fwc addr 00005554 cmd 55 0055 16bit x 16 bit
+fwc addr 0000aaaa cmd 90 0090 16bit x 16 bit
+fwc addr 00000000 cmd f0 00f0 16bit x 16 bit
+JEDEC PROBE: ID c2 2249 0
+fwc addr 00000000 cmd ff 00ff 16bit x 16 bit
+fwc addr 00000000 cmd 90 0090 16bit x 16 bit
+fwc addr 00000000 cmd ff 00ff 16bit x 16 bit
+JEDEC PROBE: ID f ea00 0
+我们可以在u-boot源码中搜索JEDEC PROBE: ID 这里就定位到flash_detect_legacy中，
+	flash_read_jedec_ids(info);
+	debug("JEDEC PROBE: ID %x %x %x\n",
+						info->manufacturer_id,
+						info->device_id,
+						info->device_id2);
+JEDEC PROBE: ID c2 2249 0
+再对比手册发现识别出了Nor flash的信息。但是为啥还会出错，我们继续往下看
+if (jedec_flash_match(info, info->start[0]))
+					break;
+这是一个匹配函数，让识别出的Nor flash从数组里面匹配，跳进去可以发现这样的数组jedec_table
+static const struct amd_flash_info jedec_table[] 
+没有匹配成功，就说明在这个结构体数组中没有我们的Nor flash，所以我们要添加。
+
+使用的是1M*16bit的芯片，这里补充一点，16bit=2Byte 也就是说这个芯片的存储字节数为2M
+参照已有的进行添加：
+
+/* JZ2440V3 使用的MT29LV160DB */
+{
+	.mfr_id 	= (u16)MX_MANUFACT,  	/*厂家ID*/
+	.dev_id 	= 0X2249,				/*设备ID*/
+	.name		= "MXIC MT29LV160DB",
+	.uaddr		= {  		/* NOR FLASH看到的解锁地址 */
+		[1] = MTD_UADDR_0x0555_0x02AA /* x16 */
+	},
+	.DevSize	= SIZE_2MiB,         		/*总大小*/
+	.CmdSet 	= P_ID_AMD_STD,			
+	.NumEraseRegions= 4,				/*擦除区域*/
+	.regions	= {
+		ERASEINFO(16*1024, 1),	
+		ERASEINFO(8*1024, 2),
+		ERASEINFO(32*1024,1),
+		ERASEINFO(64*1024, 31),
+	}
+},
+实际情况还要根据MT29LV160DB数据手册进行分析和定义
+
+代码修改完成后，进行编译，下载到单板中，查看u-boot信息：
+Flash: fwc addr 00000000 cmd f0 00f0 16bit x 16 bit
+fwc addr 0000aaaa cmd aa 00aa 16bit x 16 bit
+fwc addr 00005554 cmd 55 0055 16bit x 16 bit
+fwc addr 0000aaaa cmd 90 0090 16bit x 16 bit
+fwc addr 00000000 cmd f0 00f0 16bit x 16 bit
+JEDEC PROBE: ID c2 2249 0
+ERROR: too many flash sectors
+2 MiB
+已经识别出Nor,因为有了2MIB的信息，但是有一条错误，在源码中搜索ERROR: too many flash sectors
+意思就是有太多的分区，代码中的定义只有19个，但是
+.regions	= {
+		ERASEINFO(16*1024, 1),	
+		ERASEINFO(8*1024, 2),
+		ERASEINFO(32*1024,1),
+		ERASEINFO(64*1024, 31),
+	}
+这个芯片有35个，所以把这个宏的值改大点，这里我改的是100，足够用了。
+
+没有其它错误，把原先添加的
+//#define _DEBUG  1
+//#define   DEBUG  1  屏蔽掉
+
+重新编译代码，下载到单板，没有问题了，u-boot信息：
+U-Boot 2014.04 (Jun 14 2017 - 10:48:23)
+CPUID: 32440001
+FCLK:      400 MHz
+HCLK:      100 MHz
+PCLK:       50 MHz
+DRAM:  64 MiB
+WARNING: Caches not enabled
+Flash: 2 MiB
+*** Warning - bad CRC, using default environment
+In:    serial
+Out:   serial
+Err:   serial
+Net:   CS8900-0
+然后输入flinfo，可以看到信息，就代表成功支持NOR Flash
+
+测试一下看能不能正常使用：
+flinfo
+Sector Start Addresses:
+  00000000   RO   00004000   RO   00006000   RO   00008000   RO   00010000   RO 
+  00020000   RO   00030000   RO   00040000   RO   00050000   RO   00060000      
+  00070000   RO   00080000        00090000        000A0000        000B0000      
+  000C0000        000D0000        000E0000        000F0000        00100000      
+  00110000        00120000        00130000        00140000        00150000      
+  00160000        00170000        00180000        00190000        001A0000      
+  001B0000        001C0000        001D0000        001E0000        001F0000    
+  
+  RO代表只读，只是软件上的一种保护。
+protect off all
+  Sector Start Addresses:
+  00000000        00004000        00006000        00008000        00010000      
+  00020000        00030000        00040000        00050000        00060000      
+  00070000        00080000        00090000        000A0000        000B0000      
+  000C0000        000D0000        000E0000        000F0000        00100000      
+  00110000        00120000        00130000        00140000        00150000      
+  00160000        00170000        00180000        00190000        001A0000      
+  001B0000        001C0000        001D0000        001E0000        001F0000
+去除只读保护
+
+因为我的u-boot只有343K，换成十六进制大概为60000
+erase 60000 6ffff
+cp.b 30000000 60000 10000
+将u-boot的前10000 拷到Nor的60000起始处大小为10000
+
+md.b 30000000
+md.b 60000
+结果是相同的
+
+如果我改变其中的一个值，重新烧写是否还能相同
+mw.b 78 只写一个字节
+erase 60000 6ffff
+cp.b 30000000 60000 10000
+md.b 30000000
+md.b 60000
+结果还是相同
+
+使用命令cmp.b 30000000 80000 10000 比较结果还是相同的，说明Nor Flash没有问题了
+
+支持NAND FLASH
+在smdk2440.h中修改为 //#define CONFIG_CMD_NAND
+还原：#define CONFIG_CMD_NAND 编译出错的话将错误改掉基本上都是宏的问题
+在smdk2440.h中加入如下：
+#ifdef CONFIG_CMD_NAND
+/*jcp*/
+#define CONFIG_NAND_S3C2440
+#define CONFIG_SYS_S3C2440_NAND_HWECC
+#define CONFIG_SYS_MAX_NAND_DEVICE	1
+#define CONFIG_SYS_NAND_BASE		0x4E000000
+#endif
+/*
+在s3c2440_nand.c中将代码中的2410改为2440
+修改board_nand_init
+根据2440手册修改NAND flash控制器的初始化
+cfg = ((tacls-1)<<12)|((twrph0-1)<<8)|((twrph1-1)<<4);
+writel((1<<0) | (1<<4) | (1<<1),&nand_reg->nfcont);
+因为源代码中的是2410的寄存器内容，所以要根据2440寄存器进行修改并写入相应的值
+
+nand->select_chip = s3c2440_nand_select;
+nand->cmd_ctrl = s3c2440_hwcontrol;
+nand->dev_ready = s3c2440_dev_ready;
+主要对这三个函数进行修改根据NAND FLASH的操作进行修改
+nand_init
+	nand_init_chip
+		board_nand_init
+			设置nand_chip结构体, 提供底层的操作函数
+		nand_scan
+			nand_scan_ident
+				nand_set_defaults
+					chip->select_chip = nand_select_chip;
+					chip->cmdfunc = nand_command;
+					chip->read_byte = busw ? nand_read_byte16 : nand_read_byte;
+					
+				nand_get_flash_type
+					chip->select_chip
+					chip->cmdfunc(mtd, NAND_CMD_RESET, -1, -1);
+							nand_command()  // 即可以用来发命令，也可以用来发列地址(页内地址)、行地址(哪一页)
+								chip->cmd_ctrl
+										s3c2440_hwcontrol
+								
+					chip->cmdfunc(mtd, NAND_CMD_READID, 0x00, -1);
+					*maf_id = chip->read_byte(mtd);
+					*dev_id = chip->read_byte(mtd);
+
+
+移植DM9000
+1.将DM9000X.c编译进u-boot 修改/drivers/net的Makefile
+编译u-boot出现错误，少某些宏 和DM9000_DATA
+方法可以在u-boot查找DM9000_DATA参考其它的文件，发现少
+
+#define CONFIG_DRIVER_DM9000
+#define CONFIG_DM9000_BASE	   0x20000000
+#define DM9000_IO		   CONFIG_DM9000_BASE
+#define DM9000_DATA		   (CONFIG_DM9000_BASE + 4)
+
+这个不是随便定义的，要根据单板的情况，DM9000是内存接口
+CONFIG_DM9000_BASE确定的方法，内存接口内存控制器，会给出时序和位宽，参照JZ2440的原理图
+发现它的片选引脚用的是GS4，根据S3C2440手册，所以DM9000的基地址为0x20000000
+CMD引脚接的是LADDR2，所以#define DM9000_DATA		   (CONFIG_DM9000_BASE + 4)这里要加4
+2的话就是1<<2为100
+
+到这里DM9000移植基本完成
+在启动u-boot后，需要设置一些参数
+set ipaddr 192.168.0.3
+set serverip 192.168.0.2
+set ethaddr 08:00:3e:26:0a:5b
+tftp 32000000 uImage_ok
+设置完成后千万不要save，因为此时我们还没有给nand flash分区，所以
+不可以，但我们可以测试是否移植成功
+ping 192.168.0.2 ping成功则证明网卡已经设置成功
+
+我们可以利用tftp工具来下载内核，看是否能下载成功，如果ping成功
+的话，肯定可以下载成功的。下载后直接启动。观察现象再来解决问题
+启动内核打印出来的信息：
+0x00000000-0x00040000 : "bootloader"
+0x00040000-0x00060000 : "params"
+0x00060000-0x00260000 : "kernel"
+0x00260000-0x10000000 : "root"
+
+
+环境变量设置
+*** Warning - bad CRC, using default environment
+在启动uboot有这么一句话，意思是使用默认的环境变量
+我们可以修改一下默认的环境变量
+在源码中搜索using default environment到达 Env_default.c中
+有默认的环境变量
+CONFIG_BOOTARGS
+CONFIG_BOOTCOMMAND
+CONFIG_ETHADDR
+CONFIG_IPADDR
+CONFIG_SERVERIP
+CONFIG_NETMASK
+我们都可以在smdk2440.h中进行修改定义
+#define CONFIG_BOOTARGS "console=ttySAC0 root=/dev/mtdblock3"
+#define CONFIG_BOOTCOMMAND "nand read 30000000 kernel;bootm 30000000"
+
+#define CONFIG_NETMASK		255.255.255.0
+#define CONFIG_IPADDR		192.168.0.3
+#define CONFIG_SERVERIP	192.168.0.2
+#define CONFIG_ETHADDR		08:00:3e:26:0a:5b
+
+我们可以使uboot变的小一点，我们可以发现在uboot中有很多我们不用的
+命令，我们可以去掉
+
+接着对环境变量实现save保存在Nand flash中
+将环境变量保存在Nand flash 中，原先设置在flash中
+#define CONFIG_ENV_IS_IN_NAND
+#define CONFIG_ENV_OFFSET  0x00040000
+#define CONFIG_ENV_SIZE  	0x00020000
+#define CONFIG_ENV_RANGE	0x00020000
+设置环境变量在Nand flash的偏移地址，和大小
+
+重新编译uboot 下载进单板 重启出现倒数，分析代码是因为设置了CONFIG_BOOTCOMMAND
+然后save将设置的环境变量保存在nand flash中
+
+使用MTD命令来方便烧写内核和根文件系统
+原先烧内核的方式：
+nand erase 60000 200000
+nand write 30000000 60000 200000
+使用MTD命令后
+nand erase.part kernel
+nand write 30000000 kernel 内核大小
+MTD命令只是一种帮助工具，帮助内核的烧写，不会将分区信息传递给内核
+也不会对内核产生影响，可以参考内核的分区来进行划分
+
+烧写JFFS2
+tftp 30000000 fs_mini.jffs2
+nand erase.part rootfs
+nand write.jffs2 30000000 0x00260000 3bad48
+set bootargs console=ttySAC0 root=/dev/mtdblock3 rootfstype=jffs2
+
+需要加上#define CONFIG_CMD_NAND_YAFFS因为在烧yaffs有错误提示
+
+注意!注意!!注意!!!
+视频中对支持yaffs的代码修改并不完善, 还需要修改一个地方:
+drivers/mtd/nand/nand_util.c中
+	if (!need_skip && !(flags & WITH_DROP_FFS)) {
+改为:
+	if (!need_skip && !(flags & WITH_DROP_FFS) && !(flags & WITH_YAFFS_OOB)) {
+否则：如果分区中没有坏块(need_skip=0)时, 将执行这个分支, 导致oob区烧写不正确
+
+烧写YAFFS
+tftp 30000000 fs_mini.yaffs2
+nand erase.part rootfs
+nand write.yaffs 30000000 260000  8607c0
+
+u-boot-2014.04移植成功
+设置环境参数：
+set bootargs console=ttySAC0，115200 root=/dev/mtdblock3 rootfstype=jffs2
+set bootargs console=ttySAC0，115200 root=/dev/mtdblock3 rootfstype=yaffs
+
+移植成功linux-3.4.2
+步骤1：
+在UBOOT里：
+set machid 16a   // smdk2440  mach-smdk2440.c
+或
+set machid 7CF   // mini2440  mach-mini2440.c
+
+步骤2：
+arch\arm\mach-s3c24xx\mach-smdk2440.c
+s3c24xx_init_clocks(16934400);
+改为
+s3c24xx_init_clocks(12000000);
+
+步骤3：
+配置/编译: make s3c2410_defconfig 或 make mini2440_defconfig
+           make uImage
+
+步骤4：
+在uboot里：set bootargs console=ttySAC0,115200 .....
+
+uboot的默认MACH ID：
+gd->bd->bi_arch_number = MACH_TYPE_SMDK2410;  // 193
+如果s = getenv("machid");成功，则使用它
+否则使用默认的
+
+set machid 16a   // smdk2440  mach-smdk2440.c
+set machid 7CF   // mini2440  mach-mini2440.c
+
+nfs 32000000 192.168.1.123:/work/nfs_root/uImage_new
+bootm 32000000
+
+然后修改分区，制作新的文件系统
+jaffs2
+yffs
+
+主要是uboot的移植，内核和文件系统没有详细的步骤
+成功后整个系统就可以成功运行了
+
+在第一阶段遇到的问题：
+移植u-boot-2014.04,在分析内存分布时有一点不是很清楚，在crt0.S中有如下代码：
+	ldr	sp, [r9, #GD_START_ADDR_SP]	/* sp = gd->start_addr_sp */
+	bic	sp, sp, #7	/* 8-byte alignment for ABI compliance */
+	ldr	r9, [r9, #GD_BD]		/* r9 = gd->bd */
+	sub	r9, r9, #GD_SIZE		/* new GD is below bd */
+意思是设置栈:通过链接脚本得出sp=0x30000f60这就是先设置的栈地址
+然后在划出160字节的gd_t存放u-boot的一些信息，这个GD_SIZE就是gd_t结构体的大小
+ 
+
+
+
+
